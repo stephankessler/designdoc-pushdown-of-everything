@@ -7,6 +7,7 @@
 \usepackage{graphicx}
 \usepackage{caption}
 \usepackage{subcaption}
+\usepackage{tikz}
 
 % "define" Scala
 \lstdefinelanguage{scala}{
@@ -154,5 +155,142 @@ Otherwise, if the data source requires \textit{holistic execution}, the complete
 \end{figure}
 
 Implications for performance are as follows: Evaluating aggregates directly at the source minimizes data transfer between the source and Spark. In this case, only one row is transferred from each source partition to Spark. The number of returned rows for a data source implementing \textit{PrunedFilterScan}-interface depends on the data set, i.e., the number of rows where \textit{homewtown = `Amsterdam'}.
+
+\section{Gradual Approach}
+
+Pushing down logical plans as proposed before has the major drawback that the logical plan API has to be rather stable. Thus, we strive for a different approach not exposing the logical plan api.
+
+Design goals are as follows:
+
+\begin{itemize}
+  \item The API of the pushed down elements can stay stable, while the logical plan api might change
+  \item We add the ability to push down  operations such as aggregates. Mechanism has to be extendable to all elements of the logical plan.
+  \item The set of operations that can be pushed down depends on the datasource, i.e., a datasource could support a subset of the possibled pushed down operations.
+\end{itemize}
+
+
+
+\subsection{Current Approach for Filters and Projections}
+
+The current push down is controlled by the \textit{DataSourceStrategy}, there are two code paths involving Projections and Filters. Depending on the capabilities of the datasource, it has to implement different traits (\textit{PrunedScan,PrunedFilterScan})
+
+\textit{Projections} are currently pushed down by providing the named columns as a String, see the \textit{PrunedScan} trait.
+
+\begin{lstlisting}[frame=none,language=scala]
+@DeveloperApi
+trait PrunedScan {
+  def buildScan(requiredColumns: Array[String]): RDD[Row]
+}
+\end{lstlisting}
+
+For \textit{Filters} this is slightly different. The \textit{PrunedFilterScan} Interface requires an array containing elements of type \textit{Filter}. 
+
+\begin{lstlisting}[frame=none,language=scala]
+@DeveloperApi
+trait PrunedFilteredScan {
+  def buildScan(requiredColumns: Array[String], filters: Array[Filter]): RDD[Row]
+}
+\end{lstlisting}
+
+Expressions are converted by the function \textit{translateFilter} which is called by the \textit{DataSourceStrategy}.
+
+\subsection{Extending the Approach for Complex Parts}
+
+We need to consider two parts: First, how could we abstract the logical plan from actually pushed down operations such that we do not expose internal API. Second, we require a more flexible pushdown mechanism that reflects the datasource capabilities.
+
+\subsubsection{Abstraction of the logical plan}
+
+Following the already existing logic of creating new case classes for pushed down filters, we abstract that principle. Every operation that can be pushed down inherits the trait (or abstract class) \textit{LogicalPlanOperation}. The already existing class \textit{Filter} also has to inherit this new marker trait. See Figure~\ref{fig:inheritanceLogicalPlanOperation} for in illustration of the inheritance hierarchy.
+
+\begin{figure}
+\centering
+\begin{tikzpicture}[<-,
+  every node/.style = {shape=rectangle, rounded corners,
+    draw, align=center,
+    top color=white, bottom color=blue!20}]]
+    \tikzstyle{level 1}=[sibling distance=14em]
+    \tikzstyle{level 2}=[sibling distance=8em]
+  \node[fill=blue!20] {\textit{LogicalPlanOperation}}
+    child { node[fill=blue!20] {\textit{Aggregates}} 
+    	child { node[fill=blue!20] {\textit{Sum}}}
+    	child { node[fill=blue!20] {\textit{Avg}}}
+    }
+    child { node {Filter} 
+      child { node {GreaterThan} }
+      child { node {LessThanOrEqual} } 
+      };
+\end{tikzpicture}
+\caption{Inheritance including new \textit{LogicalPlanOperation} trait, Blue nodes represent new classes/interfaces} 
+\label{fig:inheritanceLogicalPlanOperation}
+\end{figure}
+
+For every operation that finally should become a \textit{LogicalPlanOperation} and thus can be pushed down, we require a translation step inside the \textit{DataSourceStrategy} which decouples the API of the logical plan from the `pushed down operations API'.
+
+\subsubsection{Pushdown mechanism}
+
+We propose the following \textit{ComplexDataSource} interface that a data source has to implement to retrieve \textit{LogicalPlanOperations}.
+
+\begin{lstlisting}[frame=single,language=scala]
+trait ComplexDataSource {
+ def supportsLogicalPlanOperations(ops: Seq[LogicalPlanOperations]): Boolean
+ def logicalPlanToRDD(ops: Seq[LogicalPlanOperations]): RDD[Row]
+}
+\end{lstlisting}
+
+During the physical planning, the operations have to be pushed down. The logic for that is as follows:
+
+\begin{enumerate}
+  \item Identify a part of the tree that can be translated and pushed down. This part has to satisfy the following conditions: 1) Contains only operations that have a representative as an \textit{LogicalPlanOperation} 2) Its only leaf is a \textit{ComplexDataSource}.
+  \item Translate the subtree (by definition of the first step it is a path, so technically a sequence) in a sequence of \textit{LogicalPlanOperations}
+  \item Ask the datasource if it is capable of processing that sequence (call \textit{supportsLogicalPlanOperation}), if yes call the \textit{logicalPlanToRDD} method and replace the subtree with the newly created RDD.
+\end{enumerate}
+
+\paragraph{Example}
+
+Assume a datasource supports the pushdown of \textit{sum} but not of the \textit{avg} aggregate and all the filters and projects. Following the logic explained in the paragraph before, the more elements can be pushed down for the Logical Plan in Figure~\ref{fig:pushingDownSum} than in Figure~\ref{fig:notPushingDownAvg}.
+
+\begin{figure}
+\centering
+\begin{tikzpicture}[<-,  every node/.style = {shape=rectangle, rounded corners,
+    draw, align=center,
+    top color=white, bottom color=blue!20}]]
+    \tikzstyle{level 1}=[sibling distance=4em,level distance=3em]
+  \node[fill=blue!20] {OP1} 
+    child { node[fill=yellow!20] {Filter $sum > 20$}
+   	 child { node[fill=yellow!20] {Sum(x) GroupBy(y) as sum}
+    	child { node[fill=yellow!20] {Project x,y}
+    		child { node[fill=grey!20] {ComplexDataSource(x,y,z)}
+    			}	
+    		}
+    	}
+    };
+\end{tikzpicture}
+\caption{Pushdown example, yellow nodes can be translated and pushed to the datasource} 
+\label{fig:pushingDownSum}
+\end{figure}
+
+\begin{figure}
+\centering
+\begin{tikzpicture}[<-,  every node/.style = {shape=rectangle, rounded corners,
+    draw, align=center,
+    top color=white, bottom color=blue!20}]]
+    \tikzstyle{level 1}=[sibling distance=4em,level distance=3em]
+ \node[fill=blue!20] {OP1} 
+    child { node[fill=blue!20] {Filter $avg > 20$}
+   	 child { node[fill=blue!20] {Avg(x) GroupBy(y) as avg}
+    	child { node[fill=yellow!20] {Project x,y}
+    		child { node[fill=grey!20] {ComplexDataSource(x,y,z)}
+    			}	
+    		}
+    	}
+    };
+\end{tikzpicture}
+\caption{Pushdown example, yellow nodes can be translated and pushed to the datasource} 
+\label{fig:notPushingDownAvg}
+\end{figure}
+
+\paragraph{Aliasing, Naming, etc.}
+
+In the current implementation names of columns where only strings. However, if we also allow aliases (e.g., for aggregates) we should also push down proper attribute references. This could be done by defining a (stable) case class and inheriting \textit{LogicalPlanOperation} or by using the already defined expressions.
 
 \end{document}
